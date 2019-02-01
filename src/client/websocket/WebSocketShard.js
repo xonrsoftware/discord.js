@@ -113,8 +113,16 @@ class WebSocketShard extends EventEmitter {
     /**
      * Whether or not the WebSocket is expected to be closed
      * @type {boolean}
+     * @private
      */
     this.expectingClose = false;
+
+    /**
+     * Whether or not the shard has received a heartbeat ack.
+     * @type {?boolean}
+     * @private
+     */
+    this.heartbeatAcked = null;
 
     this.connect();
   }
@@ -158,8 +166,17 @@ class WebSocketShard extends EventEmitter {
       return;
     }
 
+    if (this.heartbeatAcked === false) {
+      this.manager.debug('Retrying connection due to not receiving a heartbeat in time');
+      if (this.ws) this.ws.close(1001);
+      this.ws = null;
+      this.heartbeatAcked = null;
+      return;
+    }
+
     this.debug('Sending a heartbeat');
     this.lastPingTimestamp = Date.now();
+    this.heartbeatAcked = false;
     this.send({
       op: OPCodes.HEARTBEAT,
       d: this.sequence,
@@ -174,6 +191,7 @@ class WebSocketShard extends EventEmitter {
     const latency = Date.now() - this.lastPingTimestamp;
     this.debug(`Heartbeat acknowledged, latency of ${latency}ms`);
     this.pings.unshift(latency);
+    this.heartbeatAcked = true;
     if (this.pings.length > 3) this.pings.length = 3;
   }
 
@@ -187,16 +205,20 @@ class WebSocketShard extends EventEmitter {
       flush: zlib.Z_SYNC_FLUSH,
       to: WebSocket.encoding === 'json' ? 'string' : '',
     });
+
     const gateway = this.manager.gateway;
     this.debug(`Connecting to ${gateway}`);
+    this.ws = null;
     const ws = this.ws = WebSocket.create(gateway, {
       v: this.manager.client.options.ws.version,
       compress: 'zlib-stream',
     });
+
     ws.onopen = this.onOpen.bind(this);
     ws.onmessage = this.onMessage.bind(this);
     ws.onerror = this.onError.bind(this);
     ws.onclose = this.onClose.bind(this);
+
     this.status = Status.CONNECTING;
   }
 
@@ -229,7 +251,6 @@ class WebSocketShard extends EventEmitter {
         break;
       }
     }
-
     if (packet.s > this.sequence) this.sequence = packet.s;
 
     switch (packet.op) {
@@ -237,20 +258,16 @@ class WebSocketShard extends EventEmitter {
         this.identify();
         return this.heartbeat(packet.d.heartbeat_interval);
       case OPCodes.RECONNECT:
-        return this.reconnect();
+        // Triggers a websocket recreation since this.expectingCLose won't be filled
+        return this.ws.close(1000);
       case OPCodes.INVALID_SESSION:
-        this.sequence = -1;
         this.debug('Session invalidated');
-        // If the session isn't resumable
-        if (!packet.d) {
-          // If we had a session ID before
-          if (this.sessionID) {
-            this.sessionID = null;
-            return this.identify(2500);
-          }
-          return this.identify(5000);
-        }
-        return this.identify();
+        // Packet.d indicates whether or not the session is resumable
+        if (packet.d) return this.identify();
+        this.sequence = -1;
+        if (!this.sessionID) return this.identify(5000);
+        this.sessionID = null;
+        return this.identify(true);
       case OPCodes.HEARTBEAT_ACK:
         return this.ackHeartbeat();
       case OPCodes.HEARTBEAT:
@@ -320,7 +337,7 @@ class WebSocketShard extends EventEmitter {
       this.reconnect();
       return;
     }
-    this.emit(Events.INVALIDATED);
+    this.heartbeat(-1);
 
     /**
      * Emitted whenever the client's WebSocket encounters a connection error.
@@ -342,33 +359,39 @@ class WebSocketShard extends EventEmitter {
    * @private
    */
   onClose(event) {
+    this.heartbeatAcked = null;
     this.closeSequence = this.sequence;
-    this.emit('close', event);
+    this.status = Status.DISCONNECTED;
+    this.emit(Events.CLOSED);
+    this.heartbeat(-1);
+
+    // Check if the error indicates not being able to recover, and give up reconnecting if so
     if (event.code === 1000 ? this.expectingClose : WSCodes[event.code]) {
       /**
        * Emitted when the client's WebSocket disconnects and will no longer attempt to reconnect.
-       * @event Client#disconnect
+       * @event Client#disconnected
        * @param {CloseEvent} event The WebSocket close event
        * @param {number} shardID The shard that disconnected
        */
-      this.manager.client.emit(Events.DISCONNECT, event, this.id);
+      this.manager.client.emit(Events.DISCONNECTED, event, this.id);
       this.debug(WSCodes[event.code]);
-      this.heartbeat(-1);
-      return;
     }
-    this.expectingClose = false;
-    this.reconnect(Events.INVALIDATED, 5100);
+
+    if (!this.expectingClose) this.manager.reconnect(this);
   }
 
   /**
    * Identifies the client on a connection.
-   * @param {?number} [wait=0] Amount of time to wait before identifying
+   * @param {boolean|number} [delay] Whether or not the client should wait to identify
    * @returns {void}
    * @private
    */
-  identify(wait = 0) {
-    if (wait) return this.manager.client.setTimeout(this.identify.bind(this), wait);
-    return this.sessionID ? this.identifyResume() : this.identifyNew();
+  identify(delay) {
+    // Number between 1-5 seconds required for unresumable session
+    if (delay && isNaN(delay)) Util.delayFor((Math.random() * 4000) + 1000).then(() => this.identify());
+    else if (delay && !isNaN(delay)) Util.delayFor(delay).then(() => this.identify());
+    else if (this.sessionID) this.identifyResume();
+    else this.identifyNew();
   }
 
   /**
@@ -383,9 +406,7 @@ class WebSocketShard extends EventEmitter {
     }
     // Clone the generic payload and assign the token
     const d = Object.assign({ token: this.manager.client.token }, this.manager.client.options.ws);
-
-    const { totalShardCount } = this.manager.client.options;
-    d.shard = [this.id, Number(totalShardCount)];
+    d.shard = [this.id, Number(this.manager.client.options.totalShardCount)];
 
     // Send the payload
     this.debug('Identifying as a new session');
@@ -466,25 +487,15 @@ class WebSocketShard extends EventEmitter {
 
   /**
    * Triggers a shard reconnect.
-   * @param {?string} [event] The event for the shard to emit
    * @param {?number} [reconnectIn] Time to wait before reconnecting
-   * @returns {Promise<void>}
+   * @returns {void}
    * @private
    */
-  async reconnect(event, reconnectIn) {
+  async reconnect(reconnectIn) {
     this.heartbeat(-1);
     this.status = Status.RECONNECTING;
-
-    /**
-     * Emitted whenever a shard tries to reconnect to the WebSocket.
-     * @event Client#reconnecting
-     */
-    this.manager.client.emit(Events.RECONNECTING, this.id);
-
-    if (event === Events.INVALIDATED) this.emit(event);
-    this.debug(reconnectIn ? `Reconnecting in ${reconnectIn}ms` : 'Reconnecting now');
     if (reconnectIn) await Util.delayFor(reconnectIn);
-    this.manager.spawn(this.id);
+    this.connect();
   }
 
   /**
